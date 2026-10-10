@@ -9,7 +9,7 @@ export default {
     if (url.pathname === '/mqtt' && (req.headers.get('Upgrade') || '').toLowerCase() === 'websocket') {
       return env.RELAY.get(env.RELAY.idFromName('main')).fetch(req);
     }
-    if (url.pathname === '/ratings' || url.pathname === '/rate') {
+    if (url.pathname === '/stats' || url.pathname === '/time') {
       if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
       return env.RELAY.get(env.RELAY.idFromName('main')).fetch(req);
     }
@@ -46,8 +46,9 @@ export class Relay extends DurableObject {
     this.sql.exec('CREATE TABLE IF NOT EXISTS ret (topic TEXT PRIMARY KEY, payload TEXT, ts INTEGER)');
     this.ret = new Map(); // topic -> base64 payload (kept in memory, saved only when it changes)
     for (const r of this.sql.exec('SELECT topic, payload FROM ret')) this.ret.set(r.topic, r.payload);
-    this.sql.exec('CREATE TABLE IF NOT EXISTS rating (dev TEXT, g TEXT, r INTEGER, ts INTEGER, PRIMARY KEY (dev, g))');
-    this.sum = null; // cached { game: [sum, count] }
+    this.sql.exec('CREATE TABLE IF NOT EXISTS playtime (g TEXT, dev TEXT, s INTEGER, ts INTEGER, PRIMARY KEY (g, dev))');
+    try { this.sql.exec('ALTER TABLE playtime ADD COLUMN n INTEGER DEFAULT 0'); } catch (e) {} // number of games played (older tables lack it)
+    this.sum = null; // cached { game: [total seconds, players] }
     this.meta = new Map(); // ws -> { subs, will, id }
     this.rest = new Map(); // ws -> leftover bytes of a split packet
   }
@@ -57,20 +58,22 @@ export class Relay extends DurableObject {
     return m;
   }
   keep(ws, m) { this.meta.set(ws, m); try { ws.serializeAttachment(m); } catch (e) {} }
-  ratings() {
-    if (!this.sum) { this.sum = {}; for (const r of this.sql.exec('SELECT g, SUM(r) AS s, COUNT(*) AS n FROM rating GROUP BY g')) this.sum[r.g] = [r.s, r.n]; }
+  stats() {
+    if (!this.sum) { this.sum = {}; for (const r of this.sql.exec('SELECT g, SUM(s) AS t, COUNT(*) AS p, SUM(n) AS n FROM playtime GROUP BY g')) this.sum[r.g] = [r.t, r.p, r.n || 0]; } // [seconds, players, games]
     return this.sum;
   }
   async fetch(req) {
     const path = new URL(req.url).pathname;
-    if (path === '/ratings') return json(this.ratings());
-    if (path === '/rate') {
+    if (path === '/stats') return json(this.stats());
+    if (path === '/time') {
+      // time spent in a game, sent by each player when the game closes
       if (req.method !== 'POST') return json({ error: 'POST only' }, 405);
-      let b; try { b = await req.json(); } catch (e) { return json({ error: 'bad json' }, 400); }
-      const dev = String(b.dev || ''), g = String(b.g || ''), r = Math.round(+b.r);
-      if (!/^[A-Za-z0-9_-]{4,40}$/.test(dev) || !/^[a-z0-9_]{1,24}$/.test(g) || !(r >= 1 && r <= 5)) return json({ error: 'bad rating' }, 400);
-      this.sql.exec('INSERT OR REPLACE INTO rating (dev, g, r, ts) VALUES (?, ?, ?, ?)', dev, g, r, Date.now()); this.sum = null;
-      return json({ ok: true, g, avg: this.ratings()[g] });
+      let b; try { b = JSON.parse(await req.text()); } catch (e) { return json({ error: 'bad json' }, 400); }
+      const dev = String(b.dev || ''), g = String(b.g || ''), sec = Math.round(+b.s);
+      if (!/^[A-Za-z0-9_-]{4,40}$/.test(dev) || !/^[a-z0-9_]{1,24}$/.test(g) || !(sec >= 5 && sec <= 3600)) return json({ error: 'bad data' }, 400);
+      const one = sec >= 30 ? 1 : 0; // a real game, not a peek
+      this.sql.exec('INSERT INTO playtime (g, dev, s, ts, n) VALUES (?, ?, ?, ?, ?) ON CONFLICT(g, dev) DO UPDATE SET s = s + excluded.s, ts = excluded.ts, n = n + excluded.n', g, dev, sec, Date.now(), one);
+      this.sum = null; return json({ ok: true, g, total: this.stats()[g] });
     }
     const pair = new WebSocketPair(), [client, server] = Object.values(pair);
     this.ctx.acceptWebSocket(server);
