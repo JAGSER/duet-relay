@@ -9,10 +9,16 @@ export default {
     if (url.pathname === '/mqtt' && (req.headers.get('Upgrade') || '').toLowerCase() === 'websocket') {
       return env.RELAY.get(env.RELAY.idFromName('main')).fetch(req);
     }
+    if (url.pathname === '/ratings' || url.pathname === '/rate') {
+      if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
+      return env.RELAY.get(env.RELAY.idFromName('main')).fetch(req);
+    }
     return new Response('Duet relay is running ✓\n', { headers: { 'content-type': 'text/plain; charset=utf-8', 'access-control-allow-origin': '*' } });
   },
 };
 
+const CORS = { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, POST, OPTIONS', 'access-control-allow-headers': 'content-type', 'access-control-max-age': '86400' };
+const json = (o, st) => new Response(JSON.stringify(o), { status: st || 200, headers: Object.assign({ 'content-type': 'application/json', 'cache-control': 'no-store' }, CORS) });
 const enc = new TextEncoder(), dec = new TextDecoder();
 const MAX_PACKET = 64 * 1024, MAX_SUBS = 40, MAX_RETAINED = 20000;
 
@@ -40,6 +46,8 @@ export class Relay extends DurableObject {
     this.sql.exec('CREATE TABLE IF NOT EXISTS ret (topic TEXT PRIMARY KEY, payload TEXT, ts INTEGER)');
     this.ret = new Map(); // topic -> base64 payload (kept in memory, saved only when it changes)
     for (const r of this.sql.exec('SELECT topic, payload FROM ret')) this.ret.set(r.topic, r.payload);
+    this.sql.exec('CREATE TABLE IF NOT EXISTS rating (dev TEXT, g TEXT, r INTEGER, ts INTEGER, PRIMARY KEY (dev, g))');
+    this.sum = null; // cached { game: [sum, count] }
     this.meta = new Map(); // ws -> { subs, will, id }
     this.rest = new Map(); // ws -> leftover bytes of a split packet
   }
@@ -49,7 +57,21 @@ export class Relay extends DurableObject {
     return m;
   }
   keep(ws, m) { this.meta.set(ws, m); try { ws.serializeAttachment(m); } catch (e) {} }
+  ratings() {
+    if (!this.sum) { this.sum = {}; for (const r of this.sql.exec('SELECT g, SUM(r) AS s, COUNT(*) AS n FROM rating GROUP BY g')) this.sum[r.g] = [r.s, r.n]; }
+    return this.sum;
+  }
   async fetch(req) {
+    const path = new URL(req.url).pathname;
+    if (path === '/ratings') return json(this.ratings());
+    if (path === '/rate') {
+      if (req.method !== 'POST') return json({ error: 'POST only' }, 405);
+      let b; try { b = await req.json(); } catch (e) { return json({ error: 'bad json' }, 400); }
+      const dev = String(b.dev || ''), g = String(b.g || ''), r = Math.round(+b.r);
+      if (!/^[A-Za-z0-9_-]{4,40}$/.test(dev) || !/^[a-z0-9_]{1,24}$/.test(g) || !(r >= 1 && r <= 5)) return json({ error: 'bad rating' }, 400);
+      this.sql.exec('INSERT OR REPLACE INTO rating (dev, g, r, ts) VALUES (?, ?, ?, ?)', dev, g, r, Date.now()); this.sum = null;
+      return json({ ok: true, g, avg: this.ratings()[g] });
+    }
     const pair = new WebSocketPair(), [client, server] = Object.values(pair);
     this.ctx.acceptWebSocket(server);
     this.keep(server, { subs: [], will: null, id: '' });
